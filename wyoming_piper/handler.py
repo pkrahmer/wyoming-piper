@@ -2,12 +2,13 @@
 
 import argparse
 import asyncio
+import io
 import logging
 import math
 import re
 import tempfile
 import wave
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Union
 
 from piper import PiperVoice, SynthesisConfig
 from sentence_stream import SentenceBoundaryDetector
@@ -33,34 +34,60 @@ _VOICE: Optional[PiperVoice] = None
 _VOICE_NAME: Optional[str] = None
 _VOICE_LOCK = asyncio.Lock()
 
-# Matches [[speaker:#5]] (direct id) or [[speaker:name]] (map lookup)
-_SPEAKER_TOKEN_RE = re.compile(r"\[\[speaker:([^\]]+)\]\]")
+# Matches [[speaker:#5]], [[speaker:name]], or [[gap:500]]
+_TOKEN_RE = re.compile(r"\[\[(speaker|gap):([^\]]+)\]\]")
 
 
-def _parse_speaker_segments(
+class TextSegment(NamedTuple):
+    text: str
+    speaker: Optional[str]  # raw token value ('#5', 'angry') or None for default
+
+
+class GapSegment(NamedTuple):
+    ms: int  # silence duration in milliseconds
+
+
+Segment = Union[TextSegment, GapSegment]
+
+
+def _parse_segments(
     text: str, current_speaker: Optional[str]
-) -> List[Tuple[str, Optional[str]]]:
-    """Split text on [[speaker:...]] tokens.
+) -> List[Segment]:
+    """Split text on [[speaker:...]] and [[gap:...]] tokens.
 
-    Returns a list of (segment_text, raw_speaker) tuples where raw_speaker is
-    the token value (e.g. '#5' or 'angry') or None for the initial segment.
-    Empty segments are omitted.
+    Returns a list of TextSegment and GapSegment objects. Empty text runs are
+    omitted. Invalid gap values are logged and skipped.
     """
-    segments: List[Tuple[str, Optional[str]]] = []
+    segments: List[Segment] = []
     pos = 0
     active_speaker = current_speaker
 
-    for match in _SPEAKER_TOKEN_RE.finditer(text):
+    for match in _TOKEN_RE.finditer(text):
+        kind = match.group(1)
+        value = match.group(2)
+
+        # Emit text before this token
         seg = text[pos : match.start()]
         if seg.strip():
-            segments.append((seg, active_speaker))
-        active_speaker = match.group(1)
+            segments.append(TextSegment(text=seg, speaker=active_speaker))
+
+        if kind == "speaker":
+            active_speaker = value
+        elif kind == "gap":
+            try:
+                ms = int(value)
+                if ms < 0:
+                    raise ValueError("negative")
+                segments.append(GapSegment(ms=ms))
+            except ValueError:
+                _LOGGER.warning("Invalid gap value '%s', skipping token", value)
+
         pos = match.end()
 
     # Remaining text after last token
     tail = text[pos:]
     if tail.strip():
-        segments.append((tail, active_speaker))
+        segments.append(TextSegment(text=tail, speaker=active_speaker))
 
     return segments
 
@@ -98,6 +125,12 @@ def _resolve_speaker_id(
         "Speaker '%s' not found in voice speaker map, reverting to default", raw
     )
     return default_speaker_id
+
+
+def _silence_bytes(ms: int, rate: int, width: int, channels: int) -> bytes:
+    """Return ms milliseconds of silence as PCM zero-bytes."""
+    num_samples = int(rate * ms / 1000)
+    return b"\x00" * (num_samples * width * channels)
 
 
 class PiperEventHandler(AsyncEventHandler):
@@ -252,9 +285,8 @@ class PiperEventHandler(AsyncEventHandler):
         voice_name = voice_info.get("key", voice_name)
         assert voice_name is not None
 
-        # Split text into per-speaker segments based on [[speaker:...]] tokens.
-        # Segments that carry None use the CLI/session default speaker.
-        segments = _parse_speaker_segments(text, self._current_speaker)
+        # Parse [[speaker:...]] and [[gap:...]] tokens, splitting text into segments.
+        segments = _parse_segments(text, self._current_speaker)
         if not segments:
             # Nothing to synthesize (e.g. text was only whitespace/tokens)
             if send_stop:
@@ -282,75 +314,141 @@ class PiperEventHandler(AsyncEventHandler):
 
                 assert _VOICE is not None
 
-                # Resolve the default speaker id once for this call so that
-                # _resolve_speaker_id can revert to it on unknown tokens.
+                # Resolve the default speaker id once so _resolve_speaker_id
+                # can revert to it on unknown tokens.
                 default_speaker_id: Optional[int] = None
                 if voice_speaker is not None:
                     default_speaker_id = _resolve_speaker_id(
                         voice_speaker, _VOICE, default_speaker_id=None
                     )
 
+                # Accumulate all PCM frames here; WAV params from first TextSegment.
+                all_pcm: bytes = b""
+                rate: Optional[int] = None
+                width: Optional[int] = None
+                channels: Optional[int] = None
+
+                # GapSegments that arrive before the first TextSegment (WAV params
+                # not yet known) are stored as millisecond values and flushed once
+                # we have audio format information.
+                pending_gap_ms: int = 0
+
+                # Track whether the previous segment was a TextSegment so we know
+                # when to insert auto-padding vs. when a [[gap:n]] replaces it.
+                prev_was_text = False
+
+                sentence_silence_ms = getattr(
+                    self.cli_args, "sentence_silence_ms", 80
+                )
+
+                for seg in segments:
+                    if isinstance(seg, GapSegment):
+                        if rate is None:
+                            # WAV params not yet known — accumulate ms for later.
+                            pending_gap_ms += seg.ms
+                        else:
+                            # Explicit gap replaces auto-padding at this boundary.
+                            prev_was_text = False
+                            all_pcm += _silence_bytes(seg.ms, rate, width, channels)  # type: ignore[arg-type]
+                        continue
+
+                    # TextSegment — resolve speaker id.
+                    assert isinstance(seg, TextSegment)
+
+                    _FALLBACK = object()
+                    if seg.speaker is None:
+                        syn_config_speaker_id = default_speaker_id
+                    else:
+                        resolved = _resolve_speaker_id(
+                            seg.speaker, _VOICE, _FALLBACK  # type: ignore[arg-type]
+                        )
+                        if resolved is _FALLBACK:
+                            self._current_speaker = None
+                            syn_config_speaker_id = default_speaker_id
+                        else:
+                            self._current_speaker = seg.speaker
+                            syn_config_speaker_id = resolved  # type: ignore[assignment]
+
+                    syn_config = SynthesisConfig()
+                    syn_config.speaker_id = syn_config_speaker_id
+                    if self.cli_args.length_scale is not None:
+                        syn_config.length_scale = self.cli_args.length_scale
+                    if self.cli_args.noise_scale is not None:
+                        syn_config.noise_scale = self.cli_args.noise_scale
+                    if self.cli_args.noise_w_scale is not None:
+                        syn_config.noise_w_scale = self.cli_args.noise_w_scale
+
+                    _LOGGER.debug(
+                        "Synthesizing segment: speaker=%s, text='%s'",
+                        seg.speaker,
+                        seg.text,
+                    )
+
+                    # Synthesize into a separate buffer per segment to avoid the
+                    # "cannot change parameters after starting to write" WAV error
+                    # that occurs when reusing a single wav_writer across segments.
+                    seg_buf = io.BytesIO()
+                    seg_wav: wave.Wave_write = wave.open(seg_buf, "wb")
+                    with seg_wav:
+                        _VOICE.synthesize_wav(seg.text, seg_wav, syn_config)
+                    seg_buf.seek(0)
+                    seg_read: wave.Wave_read = wave.open(seg_buf, "rb")
+                    with seg_read:
+                        seg_rate = seg_read.getframerate()
+                        seg_width = seg_read.getsampwidth()
+                        seg_channels = seg_read.getnchannels()
+                        seg_pcm = seg_read.readframes(seg_read.getnframes())
+
+                    if rate is None:
+                        # First TextSegment — establish WAV params.
+                        rate, width, channels = seg_rate, seg_width, seg_channels
+                        # Flush any gap tokens that preceded the first text.
+                        if pending_gap_ms > 0:
+                            all_pcm += _silence_bytes(pending_gap_ms, rate, width, channels)
+                    else:
+                        # Between TextSegments: use auto-padding unless a [[gap:n]]
+                        # already separated them (prev_was_text would be False then).
+                        if prev_was_text and sentence_silence_ms > 0:
+                            all_pcm += _silence_bytes(
+                                sentence_silence_ms, rate, width, channels  # type: ignore[arg-type]
+                            )
+
+                    all_pcm += seg_pcm
+                    prev_was_text = True
+
+                if not all_pcm:
+                    # Only gap tokens, no text — nothing to write
+                    if send_stop:
+                        await self.write_event(AudioStop().event())
+                    return True
+
                 wav_writer: wave.Wave_write = wave.open(output_file, "wb")
                 with wav_writer:
-                    for seg_text, seg_raw_speaker in segments:
-                        syn_config = SynthesisConfig()
-
-                        if seg_raw_speaker is None:
-                            # No token active — use session/CLI default
-                            syn_config.speaker_id = default_speaker_id
-                        else:
-                            # _resolve_speaker_id returns a sentinel (object())
-                            # when it falls back, so we can tell the difference
-                            # between "resolved to default_speaker_id intentionally"
-                            # and "fell back because the token was invalid".
-                            _FALLBACK = object()
-                            resolved = _resolve_speaker_id(
-                                seg_raw_speaker, _VOICE, _FALLBACK  # type: ignore[arg-type]
-                            )
-                            if resolved is _FALLBACK:
-                                # Unknown token — revert instance state and use default
-                                self._current_speaker = None
-                                syn_config.speaker_id = default_speaker_id
-                            else:
-                                self._current_speaker = seg_raw_speaker
-                                syn_config.speaker_id = resolved  # type: ignore[assignment]
-
-                        if self.cli_args.length_scale is not None:
-                            syn_config.length_scale = self.cli_args.length_scale
-
-                        if self.cli_args.noise_scale is not None:
-                            syn_config.noise_scale = self.cli_args.noise_scale
-
-                        if self.cli_args.noise_w_scale is not None:
-                            syn_config.noise_w_scale = self.cli_args.noise_w_scale
-
-                        _LOGGER.debug(
-                            "Synthesizing segment: speaker=%s, text='%s'",
-                            seg_raw_speaker,
-                            seg_text,
-                        )
-                        _VOICE.synthesize_wav(seg_text, wav_writer, syn_config)
+                    wav_writer.setnchannels(channels)  # type: ignore[arg-type]
+                    wav_writer.setsampwidth(width)  # type: ignore[arg-type]
+                    wav_writer.setframerate(rate)  # type: ignore[arg-type]
+                    wav_writer.writeframes(all_pcm)
 
             output_file.seek(0)
 
             wav_file: wave.Wave_read = wave.open(output_file, "rb")
             with wav_file:
-                rate = wav_file.getframerate()
-                width = wav_file.getsampwidth()
-                channels = wav_file.getnchannels()
+                r = wav_file.getframerate()
+                w = wav_file.getsampwidth()
+                c = wav_file.getnchannels()
 
                 if send_start:
                     await self.write_event(
                         AudioStart(
-                            rate=rate,
-                            width=width,
-                            channels=channels,
+                            rate=r,
+                            width=w,
+                            channels=c,
                         ).event(),
                     )
 
                 # Audio
                 audio_bytes = wav_file.readframes(wav_file.getnframes())
-                bytes_per_sample = width * channels
+                bytes_per_sample = w * c
                 bytes_per_chunk = bytes_per_sample * self.cli_args.samples_per_chunk
                 num_chunks = int(math.ceil(len(audio_bytes) / bytes_per_chunk))
 
@@ -362,9 +460,9 @@ class PiperEventHandler(AsyncEventHandler):
                     await self.write_event(
                         AudioChunk(
                             audio=chunk,
-                            rate=rate,
-                            width=width,
-                            channels=channels,
+                            rate=r,
+                            width=w,
+                            channels=c,
                         ).event(),
                     )
 

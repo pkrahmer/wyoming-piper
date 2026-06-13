@@ -62,6 +62,12 @@ async def main() -> None:
     )
     parser.add_argument("--samples-per-chunk", type=int, default=1024)
     parser.add_argument(
+        "--sentence-silence-ms",
+        type=int,
+        default=80,
+        help="Milliseconds of silence to insert between synthesized segments (default: 80)",
+    )
+    parser.add_argument(
         "--no-streaming",
         action="store_true",
         help="Disable audio streaming on sentence boundaries",
