@@ -4,9 +4,10 @@ import argparse
 import asyncio
 import logging
 import math
+import re
 import tempfile
 import wave
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from piper import PiperVoice, SynthesisConfig
 from sentence_stream import SentenceBoundaryDetector
@@ -32,6 +33,72 @@ _VOICE: Optional[PiperVoice] = None
 _VOICE_NAME: Optional[str] = None
 _VOICE_LOCK = asyncio.Lock()
 
+# Matches [[speaker:#5]] (direct id) or [[speaker:name]] (map lookup)
+_SPEAKER_TOKEN_RE = re.compile(r"\[\[speaker:([^\]]+)\]\]")
+
+
+def _parse_speaker_segments(
+    text: str, current_speaker: Optional[str]
+) -> List[Tuple[str, Optional[str]]]:
+    """Split text on [[speaker:...]] tokens.
+
+    Returns a list of (segment_text, raw_speaker) tuples where raw_speaker is
+    the token value (e.g. '#5' or 'angry') or None for the initial segment.
+    Empty segments are omitted.
+    """
+    segments: List[Tuple[str, Optional[str]]] = []
+    pos = 0
+    active_speaker = current_speaker
+
+    for match in _SPEAKER_TOKEN_RE.finditer(text):
+        seg = text[pos : match.start()]
+        if seg.strip():
+            segments.append((seg, active_speaker))
+        active_speaker = match.group(1)
+        pos = match.end()
+
+    # Remaining text after last token
+    tail = text[pos:]
+    if tail.strip():
+        segments.append((tail, active_speaker))
+
+    return segments
+
+
+def _resolve_speaker_id(
+    raw: Optional[str],
+    voice: "PiperVoice",
+    default_speaker_id: Optional[int],
+) -> Optional[int]:
+    """Resolve a raw speaker token value to a speaker_id integer.
+
+    Syntax:
+      '#5'   -> direct id 5 (bypasses name map)
+      'name' -> look up in voice.config.speaker_id_map
+
+    Returns default_speaker_id and logs a warning if the value cannot be
+    resolved.
+    """
+    if raw is None:
+        return default_speaker_id
+
+    if raw.startswith("#"):
+        try:
+            return int(raw[1:])
+        except ValueError:
+            _LOGGER.warning("Invalid direct speaker id '%s', reverting to default", raw)
+            return default_speaker_id
+
+    # Name lookup
+    speaker_id_map = getattr(getattr(voice, "config", None), "speaker_id_map", {}) or {}
+    if raw in speaker_id_map:
+        return speaker_id_map[raw]
+
+    _LOGGER.warning(
+        "Speaker '%s' not found in voice speaker map, reverting to default", raw
+    )
+    return default_speaker_id
+
 
 class PiperEventHandler(AsyncEventHandler):
     def __init__(
@@ -50,6 +117,7 @@ class PiperEventHandler(AsyncEventHandler):
         self.is_streaming: Optional[bool] = None
         self.sbd = SentenceBoundaryDetector()
         self._synthesize: Optional[Synthesize] = None
+        self._current_speaker: Optional[str] = None  # tracks active speaker across sentences
 
     async def handle_event(self, event: Event) -> bool:
         if Describe.is_type(event.type):
@@ -69,6 +137,7 @@ class PiperEventHandler(AsyncEventHandler):
                 synthesize = Synthesize.from_event(event)
                 self._synthesize = Synthesize(text="", voice=synthesize.voice)
                 self.sbd = SentenceBoundaryDetector()
+                self._current_speaker = None
                 start_sent = False
                 for i, sentence in enumerate(self.sbd.add_chunk(synthesize.text)):
                     self._synthesize.text = sentence
@@ -99,6 +168,7 @@ class PiperEventHandler(AsyncEventHandler):
                 self.is_streaming = True
                 self.sbd = SentenceBoundaryDetector()
                 self._synthesize = Synthesize(text="", voice=stream_start.voice)
+                self._current_speaker = None
                 _LOGGER.debug("Text stream started: voice=%s", stream_start.voice)
                 return True
 
@@ -172,7 +242,7 @@ class PiperEventHandler(AsyncEventHandler):
             voice_name = self.cli_args.voice
 
         if voice_name == self.cli_args.voice:
-            # Default speaker
+            # Default speaker from CLI (used as the revert-to-default value)
             voice_speaker = voice_speaker or self.cli_args.speaker
 
         assert voice_name is not None
@@ -182,11 +252,20 @@ class PiperEventHandler(AsyncEventHandler):
         voice_name = voice_info.get("key", voice_name)
         assert voice_name is not None
 
+        # Split text into per-speaker segments based on [[speaker:...]] tokens.
+        # Segments that carry None use the CLI/session default speaker.
+        segments = _parse_speaker_segments(text, self._current_speaker)
+        if not segments:
+            # Nothing to synthesize (e.g. text was only whitespace/tokens)
+            if send_stop:
+                await self.write_event(AudioStop().event())
+            return True
+
         with tempfile.NamedTemporaryFile(mode="wb+", suffix=".wav") as output_file:
             async with _VOICE_LOCK:
                 if voice_name != _VOICE_NAME:
                     # Load new voice
-                    _LOGGER.debug("Loading voice: %s", _VOICE_NAME)
+                    _LOGGER.debug("Loading voice: %s", voice_name)
                     ensure_voice_exists(
                         voice_name,
                         self.cli_args.data_dir,
@@ -203,35 +282,54 @@ class PiperEventHandler(AsyncEventHandler):
 
                 assert _VOICE is not None
 
-                syn_config = SynthesisConfig()
+                # Resolve the default speaker id once for this call so that
+                # _resolve_speaker_id can revert to it on unknown tokens.
+                default_speaker_id: Optional[int] = None
                 if voice_speaker is not None:
-                    syn_config.speaker_id = _VOICE.config.speaker_id_map.get(
-                        voice_speaker
+                    default_speaker_id = _resolve_speaker_id(
+                        voice_speaker, _VOICE, default_speaker_id=None
                     )
-                    if syn_config.speaker_id is None:
-                        try:
-                            # Try to interpret as an id
-                            syn_config.speaker_id = int(voice_speaker)
-                        except ValueError:
-                            pass
-
-                    if syn_config.speaker_id is None:
-                        _LOGGER.warning(
-                            "No speaker '%s' for voice '%s'", voice_speaker, voice_name
-                        )
-
-                if self.cli_args.length_scale is not None:
-                    syn_config.length_scale = self.cli_args.length_scale
-
-                if self.cli_args.noise_scale is not None:
-                    syn_config.noise_scale = self.cli_args.noise_scale
-
-                if self.cli_args.noise_w_scale is not None:
-                    syn_config.noise_w_scale = self.cli_args.noise_w_scale
 
                 wav_writer: wave.Wave_write = wave.open(output_file, "wb")
                 with wav_writer:
-                    _VOICE.synthesize_wav(text, wav_writer, syn_config)
+                    for seg_text, seg_raw_speaker in segments:
+                        syn_config = SynthesisConfig()
+
+                        if seg_raw_speaker is None:
+                            # No token active — use session/CLI default
+                            syn_config.speaker_id = default_speaker_id
+                        else:
+                            # _resolve_speaker_id returns a sentinel (object())
+                            # when it falls back, so we can tell the difference
+                            # between "resolved to default_speaker_id intentionally"
+                            # and "fell back because the token was invalid".
+                            _FALLBACK = object()
+                            resolved = _resolve_speaker_id(
+                                seg_raw_speaker, _VOICE, _FALLBACK  # type: ignore[arg-type]
+                            )
+                            if resolved is _FALLBACK:
+                                # Unknown token — revert instance state and use default
+                                self._current_speaker = None
+                                syn_config.speaker_id = default_speaker_id
+                            else:
+                                self._current_speaker = seg_raw_speaker
+                                syn_config.speaker_id = resolved  # type: ignore[assignment]
+
+                        if self.cli_args.length_scale is not None:
+                            syn_config.length_scale = self.cli_args.length_scale
+
+                        if self.cli_args.noise_scale is not None:
+                            syn_config.noise_scale = self.cli_args.noise_scale
+
+                        if self.cli_args.noise_w_scale is not None:
+                            syn_config.noise_w_scale = self.cli_args.noise_w_scale
+
+                        _LOGGER.debug(
+                            "Synthesizing segment: speaker=%s, text='%s'",
+                            seg_raw_speaker,
+                            seg_text,
+                        )
+                        _VOICE.synthesize_wav(seg_text, wav_writer, syn_config)
 
             output_file.seek(0)
 
